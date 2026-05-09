@@ -1,0 +1,23 @@
+[tool.pylint.basic]
+good-names = ["M", "w", "h", "p", "t", "x", "y", "X", "n", "k", "c", "d", "i", "j", "_"]
+
+[tool.pylint.format]
+max-line-length = 110
+
+[tool.pylint.design]
+max-locals = 25
+max-args = 8
+max-positional-arguments = 8
+max-statements = 80
+max-branches = 15
+max-attributes = 20
+
+[tool.pylint.similarities]
+min-similarity-lines = 8
+
+[tool.pylint."messages control"]
+disable = [
+    "invalid-name",
+    "missing-function-docstring",
+    "too-many-locals",
+]

@@ -1,0 +1,34 @@
+# Data and runtime artifacts (regenerable)
+data/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Lint/test outputs
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# OS
+Thumbs.db
+desktop.ini
