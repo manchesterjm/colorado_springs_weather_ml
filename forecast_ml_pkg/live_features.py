@@ -8,6 +8,7 @@ feature row matching the artifact's ``feature_names``.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 from typing import Optional
@@ -15,6 +16,11 @@ from typing import Optional
 import numpy as np
 
 from weather_regime_pkg import (avg_temp, classify, doy, fetch_acis)
+
+from forecast_ml_pkg import db as fdb, mex_mos, nws_features as nwsf
+from forecast_ml_pkg.externals import tz_utils
+
+logger = logging.getLogger(__name__)
 
 
 def load_classified_data(
@@ -101,3 +107,116 @@ def build_anchor_features(
             nrow["pcpn"] if nrow["pcpn"] is not None else np.nan,
         ])
     return np.array([feat], dtype=float)
+
+
+def fetch_nws_features_for_anchor(
+    anchor_date_str: str,
+    artifact: dict,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Return the (1, 28) NWS feature row for live inference, plus diagnostics.
+
+    Strategy:
+      1. Try to read from the local archive (``nws_daily_forecast``).
+      2. If horizons are missing, attempt a live MEX fetch from IEM and upsert
+         the result into the archive before retrying the lookup.
+      3. Anything still missing falls back to DOY-mean climatology stored in
+         the artifact and flips the corresponding ``nws_available_h*`` indicator
+         to 0.
+
+    Diagnostics returned: ``{"source": "archive"|"live"|"impute"|"mixed",
+    "n_available": int, "n_imputed": int}`` so the runner can log + warn.
+    """
+    hi_clim = artifact.get("nws_hi_clim")
+    lo_clim = artifact.get("nws_lo_clim")
+    if hi_clim is None or lo_clim is None:
+        raise ValueError(
+            "Artifact is missing nws_hi_clim/nws_lo_clim; not a nwsfeat model."
+        )
+
+    lookup = nwsf.load_mex_lookup(
+        start_anchor=anchor_date_str, end_anchor=anchor_date_str,
+    )
+    available = sum(
+        1 for h in nwsf.HORIZONS if (anchor_date_str, h) in lookup
+    )
+    source = "archive"
+
+    if available < len(nwsf.HORIZONS):
+        # Try a live IEM fetch for anchor 12Z. Safety net only.
+        runtime = f"{anchor_date_str}T12:00:00Z"
+        try:
+            raw = mex_mos.fetch_bulletin("KCOS", runtime)
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            logger.warning("live MEX fetch failed for %s: %s", runtime, exc)
+            raw = None
+        if raw:
+            norm = mex_mos.normalize_rows("KCOS", raw)
+            entries = mex_mos.derive_daily_entries(norm)
+            conn = fdb.get_connection()
+            try:
+                fetched_at = tz_utils.now_utc()
+                for r in norm:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO mex_mos_raw (
+                            station_id, runtime_utc, ftime_utc,
+                            n_x, tmp, dpt, wsp, p12, q12, t12, snw,
+                            raw_json, fetched_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            r.station_id, r.runtime_utc, r.ftime_utc,
+                            r.n_x, r.tmp, r.dpt, r.wsp, r.p12, r.q12, r.t12, r.snw,
+                            r.raw_json, fetched_at,
+                        ),
+                    )
+                for e in entries:
+                    if e.horizon_days < 1:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO nws_daily_forecast (
+                            station_id, issue_date_local, target_date_local,
+                            horizon_days, nws_hi_f, nws_lo_f,
+                            nws_pop_day, nws_pop_night, source, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "KCOS", e.issue_date_local, e.target_date_local,
+                            e.horizon_days, e.nws_hi_f, e.nws_lo_f,
+                            e.nws_pop_day, e.nws_pop_night, "MEX_MOS", fetched_at,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            lookup = nwsf.load_mex_lookup(
+                start_anchor=anchor_date_str, end_anchor=anchor_date_str,
+            )
+            new_available = sum(
+                1 for h in nwsf.HORIZONS if (anchor_date_str, h) in lookup
+            )
+            if new_available > available:
+                source = "live" if available == 0 else "mixed"
+                available = new_available
+
+    row = nwsf.build_nws_feature_row(anchor_date_str, lookup, hi_clim, lo_clim)
+    n_imputed = len(nwsf.HORIZONS) - available
+    if available == 0:
+        source = "impute"
+        logger.warning(
+            "No MEX data for anchor %s; imputing all 7 horizons from climatology.",
+            anchor_date_str,
+        )
+    elif n_imputed > 0:
+        logger.warning(
+            "Partial MEX coverage for anchor %s: %d/%d horizons imputed.",
+            anchor_date_str, n_imputed, len(nwsf.HORIZONS),
+        )
+
+    diag = {
+        "source": source,
+        "n_available": available,
+        "n_imputed": n_imputed,
+    }
+    return row.reshape(1, -1), diag

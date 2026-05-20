@@ -1,3 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forecast_ml_pkg"
+version = "0.1.0"
+description = "Colorado Springs daily weather ML forecaster (KCOS, h=1..7)."
+requires-python = ">=3.10"
+dependencies = ["numpy", "scikit-learn"]
+
+[tool.setuptools]
+# Only the library is a package; scripts/ stays a flat directory of
+# entry-point scripts. weather_regime_pkg / db_utils / tz_utils live under
+# D:\Scripts and are put on sys.path at runtime by forecast_ml_pkg/__init__.py.
+packages = ["forecast_ml_pkg"]
+
 [tool.pylint.basic]
 good-names = ["M", "w", "h", "p", "t", "x", "y", "X", "n", "k", "c", "d", "i", "j", "_"]
 
@@ -15,9 +32,20 @@ max-attributes = 20
 [tool.pylint.similarities]
 min-similarity-lines = 8
 
+[tool.pylint.typecheck]
+# Sister-project modules that live under D:\Scripts and are put on sys.path at
+# runtime by forecast_ml_pkg/__init__.py. The linter cannot resolve them
+# statically; that is expected, not an error.
+ignored-modules = ["weather_regime_pkg", "db_utils", "script_metrics", "tz_utils"]
+
 [tool.pylint."messages control"]
 disable = [
     "invalid-name",
     "missing-function-docstring",
     "too-many-locals",
+    # weather_regime_pkg and the D:\Scripts helper modules must be imported
+    # *after* the forecast_ml_pkg import that injects them onto sys.path.
+    # That deliberately violates the std / third-party / first-party import
+    # ordering, so the ordering check is not meaningful for this project.
+    "wrong-import-order",
 ]

@@ -17,32 +17,23 @@ script writes to.
 from __future__ import annotations
 
 import argparse
-import json
 import pickle
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import blend, db as fdb, live_features, output
+from forecast_ml_pkg.externals import db_utils, setup_utf8_stdout, tz_utils
 
-from forecast_ml_pkg import blend, db as fdb, live_features, output  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import setup_utf8_stdout, tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-from weather_regime_pkg import STATE_LABELS, doy, fetch_latest_nws_snapshot  # noqa: E402  pylint: disable=wrong-import-position
-from weather_regime_pkg.nws import (  # noqa: E402  pylint: disable=wrong-import-position
+from weather_regime_pkg import STATE_LABELS, fetch_latest_nws_snapshot
+from weather_regime_pkg.nws import (
     estimate_p_heavy_given_wet, nws_to_probs,
 )
 
 
-WEATHER_DB = Path(r"D:\Scripts\weather_data\weather.db") if sys.platform == "win32" \
-    else Path("/mnt/d/Scripts/weather_data/weather.db")
 REPORTS_DIR = fdb.PROJECT_ROOT / "reports"
 
 
@@ -50,27 +41,31 @@ REPORTS_DIR = fdb.PROJECT_ROOT / "reports"
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_active_model() -> tuple[dict, str, str]:
-    """Read the most recent ``is_active=1`` row in ``model_runs`` and load.
+def load_active_models() -> list[tuple[dict, str, str, str]]:
+    """Read every ``is_active=1`` row in ``model_runs``, load each artifact.
 
-    Returns ``(artifact_dict, model_version, run_id)``.
+    Returns a list of ``(artifact, model_version, run_id, variant)`` ordered by
+    variant (``baseline`` first, then ``nwsfeat`` so output is stable).
+    Raises if no active models exist.
     """
     conn = fdb.get_connection()
     try:
-        row = conn.execute(
-            "SELECT run_id, model_version, artifact_path FROM model_runs "
-            "WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT run_id, model_version, artifact_path, variant FROM model_runs "
+            "WHERE is_active = 1 ORDER BY variant"
+        ).fetchall()
     finally:
         conn.close()
-    if row is None:
+    if not rows:
         raise RuntimeError(
-            "No active model in model_runs. Run train_extended.py first."
+            "No active models in model_runs. Run train_extended.py first."
         )
-    run_id, model_version, artifact_path = row
-    with open(artifact_path, "rb") as fh:
-        artifact = pickle.load(fh)
-    return artifact, model_version, run_id
+    out: list[tuple[dict, str, str, str]] = []
+    for run_id, model_version, artifact_path, variant in rows:
+        with open(artifact_path, "rb") as fh:
+            artifact = pickle.load(fh)
+        out.append((artifact, model_version, run_id, variant))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +103,7 @@ def fetch_nws_for_dates(
     target_dates: list[str], as_of_date: str
 ) -> tuple[Optional[str], dict[str, dict]]:
     """Latest NWS snapshot keyed by local target date string."""
-    conn = sqlite3.connect(WEATHER_DB)
+    conn = sqlite3.connect(db_utils.DB_PATH)
     try:
         fetch_time, by_date = fetch_latest_nws_snapshot(conn, as_of_date)
     finally:
@@ -116,7 +111,9 @@ def fetch_nws_for_dates(
     return fetch_time, {d: by_date[d] for d in target_dates if d in by_date}
 
 
-def nws_summary_for_date(nws_day: dict) -> tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+def nws_summary_for_date(
+    nws_day: dict,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
     """Pull (hi, lo, pop_pct, text) from one fetch_latest_nws_snapshot row."""
     hi = max(nws_day["highs"]) if nws_day.get("highs") else None
     lo = min(nws_day["lows"]) if nws_day.get("lows") else None
@@ -129,58 +126,49 @@ def nws_summary_for_date(nws_day: dict) -> tuple[Optional[float], Optional[float
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def run_forecast() -> output.ForecastResult:  # pylint: disable=too-many-locals
-    artifact, model_version, run_id = load_active_model()
-    print(f"Active model: {model_version} (run {run_id})")
-    print(f"  Trained through {artifact['trained_through']}, "
-          f"horizons {artifact['horizons']}, "
-          f"feature count {len(artifact['feature_names'])}")
+def _build_anchor_X(artifact: dict) -> tuple[np.ndarray, list[dict], int]:
+    """Build the model-ready X for one artifact.
 
+    Returns ``(X, rows, anchor_idx)``. If the artifact is a nwsfeat variant,
+    the 28 NWS columns are appended to X (with archive -> live MEX -> impute
+    fallback chain).
+    """
     rows, neighbor_lookups = live_features.load_classified_data(artifact)
     anchor_idx = live_features.find_anchor_index(rows)
     if anchor_idx is None:
         raise RuntimeError("No suitable anchor day found in ACIS data.")
-
-    anchor = rows[anchor_idx]
-    anchor_date = anchor["date"]
-    anchor_state_label = STATE_LABELS[anchor["state"]]
-    print(f"\nAnchor day: {anchor_date} state={anchor_state_label} "
-          f"Hi={anchor['maxt']} Lo={anchor['mint']} "
-          f"precip={anchor['pcpn']}")
-
     X = live_features.build_anchor_features(
         rows, anchor_idx, artifact["doy_clim_temp"], neighbor_lookups,
     )
+    if artifact.get("use_nws_features"):
+        anchor_date = rows[anchor_idx]["date"]
+        nws_row, diag = live_features.fetch_nws_features_for_anchor(
+            anchor_date, artifact,
+        )
+        print(
+            f"  NWS features: source={diag['source']} "
+            f"available={diag['n_available']}/7 imputed={diag['n_imputed']}"
+        )
+        X = np.hstack([X, nws_row])
+    return X, rows, anchor_idx
 
-    # Compute target dates for each horizon (anchor_date + h)
+
+def _predict_one_model(
+    artifact: dict,
+    model_version: str,
+    run_id: str,
+    nws_by_date: dict[str, dict],
+    nws_fetch_time: Optional[str],
+    p_heavy_given_wet: float,
+) -> output.ForecastResult:
+    """Run one model end-to-end and return its ForecastResult."""
+    X, rows, anchor_idx = _build_anchor_X(artifact)
+    anchor = rows[anchor_idx]
+    anchor_date = anchor["date"]
+    anchor_state_label = STATE_LABELS[anchor["state"]]
     anchor_dt = datetime.strptime(anchor_date, "%Y-%m-%d").date()
     horizons = list(artifact["horizons"])
     target_dates = {h: (anchor_dt + timedelta(days=h)).isoformat() for h in horizons}
-
-    # NWS lookup -- as_of_date is today (UTC). Query for "today" snapshot.
-    today_utc = datetime.now(timezone.utc).date().isoformat()
-    nws_fetch_time, nws_by_date = fetch_nws_for_dates(
-        list(target_dates.values()), today_utc,
-    )
-    if not nws_by_date:
-        # Fallback to most recent available snapshot (no date filter).
-        conn = sqlite3.connect(WEATHER_DB)
-        try:
-            cur = conn.execute(
-                "SELECT MAX(substr(fetch_time, 1, 10)) FROM forecast_snapshots"
-            )
-            latest = cur.fetchone()[0]
-        finally:
-            conn.close()
-        if latest:
-            nws_fetch_time, nws_by_date = fetch_nws_for_dates(
-                list(target_dates.values()), latest,
-            )
-
-    # Estimate P(heavy | wet) climatologically from the same KCOS rows used
-    # to train (anchor through trained_through window).
-    train_rows = [r for r in rows if r["date"] <= artifact["trained_through"]]
-    p_heavy_given_wet = estimate_p_heavy_given_wet(train_rows)
 
     # Per-horizon predictions
     horizon_payloads: list[output.HorizonForecast] = []
@@ -248,6 +236,64 @@ def run_forecast() -> output.ForecastResult:  # pylint: disable=too-many-locals
     )
 
 
+def run_forecast() -> list[output.ForecastResult]:
+    """Generate one ``ForecastResult`` per active model variant.
+
+    Each variant produces its own predictions, blend with NWS, and ForecastResult.
+    The list is ordered ``baseline`` first, ``nwsfeat`` second (matching the
+    ordering from ``load_active_models``).
+    """
+    models = load_active_models()
+    print(f"Active models: {len(models)}")
+    for artifact, version, run_id, variant in models:
+        print(
+            f"  [{variant:8s}] {version} (run {run_id}) | "
+            f"features={len(artifact['feature_names'])} "
+            f"horizons={tuple(artifact['horizons'])}"
+        )
+
+    # Compute the anchor date once using the first artifact (both share data).
+    primary_artifact = models[0][0]
+    primary_rows, _ = live_features.load_classified_data(primary_artifact)
+    anchor_idx = live_features.find_anchor_index(primary_rows)
+    if anchor_idx is None:
+        raise RuntimeError("No suitable anchor day found in ACIS data.")
+    anchor_dt = datetime.strptime(primary_rows[anchor_idx]["date"], "%Y-%m-%d").date()
+    horizons = list(primary_artifact["horizons"])
+    target_dates = [(anchor_dt + timedelta(days=h)).isoformat() for h in horizons]
+
+    # One NWS fetch for all variants.
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    nws_fetch_time, nws_by_date = fetch_nws_for_dates(target_dates, today_utc)
+    if not nws_by_date:
+        conn = sqlite3.connect(db_utils.DB_PATH)
+        try:
+            cur = conn.execute(
+                "SELECT MAX(substr(fetch_time, 1, 10)) FROM forecast_snapshots"
+            )
+            latest = cur.fetchone()[0]
+        finally:
+            conn.close()
+        if latest:
+            nws_fetch_time, nws_by_date = fetch_nws_for_dates(target_dates, latest)
+
+    # One p_heavy estimate using the primary (baseline) artifact's training window.
+    train_rows = [
+        r for r in primary_rows if r["date"] <= primary_artifact["trained_through"]
+    ]
+    p_heavy_given_wet = estimate_p_heavy_given_wet(train_rows)
+
+    results: list[output.ForecastResult] = []
+    for artifact, version, run_id, variant in models:
+        print(f"\n--- predicting with {variant} ---")
+        result = _predict_one_model(
+            artifact, version, run_id,
+            nws_by_date, nws_fetch_time, p_heavy_given_wet,
+        )
+        results.append(result)
+    return results
+
+
 def main() -> int:
     setup_utf8_stdout()
     parser = argparse.ArgumentParser(description="Daily forecast runner")
@@ -266,21 +312,26 @@ def main() -> int:
     args = parser.parse_args()
 
     fdb.init_db()
-    result = run_forecast()
+    results = run_forecast()
     print()
-    print(output.render_text(result))
+    for result in results:
+        print(output.render_text(result))
 
     if args.print_only or args.no_markdown:
         md_path = None
     else:
-        md_path = output.write_markdown_report(result, REPORTS_DIR)
+        # Write one combined markdown per issue date; each variant gets its own
+        # section so blame-by-variant comparison is one scroll away.
+        md_path = output.write_multi_variant_report(results, REPORTS_DIR)
         print(f"Markdown report: {md_path}")
 
     if args.print_only or args.no_db:
         inserted = 0
     else:
-        inserted = output.write_to_db(result)
-        print(f"Wrote {inserted}/{len(result.horizons)} production_forecast rows")
+        inserted = sum(output.write_to_db(r) for r in results)
+        total_horizons = sum(len(r.horizons) for r in results)
+        print(f"Wrote {inserted}/{total_horizons} production_forecast rows "
+              f"({len(results)} variants x {len(results[0].horizons)} horizons)")
     return 0
 
 

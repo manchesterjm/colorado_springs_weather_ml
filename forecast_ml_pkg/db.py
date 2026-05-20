@@ -20,6 +20,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from forecast_ml_pkg.externals import db_utils
+
 # Path-aware DB location so this works the same in Windows and WSL.
 if sys.platform == "win32":
     PROJECT_ROOT = Path(r"D:\Projects\CO_Springs_Weather_ML")
@@ -173,11 +175,13 @@ SCHEMA: tuple[str, ...] = (
         feature_names_json TEXT,
         artifact_path TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        is_active INTEGER NOT NULL DEFAULT 0
+        is_active INTEGER NOT NULL DEFAULT 0,
+        variant TEXT NOT NULL DEFAULT 'baseline'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_model_runs_created ON model_runs(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_model_runs_active ON model_runs(is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_model_runs_variant ON model_runs(variant)",
 
     # Training cache: materialized (anchor_date, horizon) feature rows.
     # ``feature_json`` stores the full feature dict so retrains do not need
@@ -240,6 +244,91 @@ SCHEMA: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_backfill_status
         ON backfill_progress(status)
     """,
+
+    # Raw MEX MOS bulletins from the Iowa State Mesonet archive. One row per
+    # (station, runtime, ftime). Stores the parsed JSON record verbatim so any
+    # future feature work can pull additional MOS fields (dewpoint, wind,
+    # thunderstorm prob, etc.) without re-fetching from the archive.
+    """
+    CREATE TABLE IF NOT EXISTS mex_mos_raw (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_id TEXT NOT NULL,
+        runtime_utc TEXT NOT NULL,
+        ftime_utc TEXT NOT NULL,
+        n_x INTEGER,
+        tmp INTEGER,
+        dpt INTEGER,
+        wsp INTEGER,
+        p12 INTEGER,
+        q12 REAL,
+        t12 TEXT,
+        snw REAL,
+        raw_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        UNIQUE(station_id, runtime_utc, ftime_utc)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_mex_raw_runtime
+        ON mex_mos_raw(runtime_utc)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_mex_raw_ftime
+        ON mex_mos_raw(ftime_utc)
+    """,
+
+    # Derived per-target-date NWS forecast Hi/Lo/PoP used as ML features.
+    # source identifies origin: 'MEX_MOS' for historical bulletins, or
+    # 'NWS_DIGITAL' for live aggregates from weather.db.digital_forecast.
+    # horizon_days = (target - issue) in days; negative is meaningless for
+    # this table (rows where target_date_local <= issue_date_local are
+    # excluded at insert time).
+    """
+    CREATE TABLE IF NOT EXISTS nws_daily_forecast (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_id TEXT NOT NULL,
+        issue_date_local TEXT NOT NULL,
+        target_date_local TEXT NOT NULL,
+        horizon_days INTEGER NOT NULL,
+        nws_hi_f REAL,
+        nws_lo_f REAL,
+        nws_pop_day REAL,
+        nws_pop_night REAL,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(station_id, issue_date_local, target_date_local, source)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_nws_daily_issue
+        ON nws_daily_forecast(issue_date_local)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_nws_daily_target
+        ON nws_daily_forecast(target_date_local)
+    """,
+
+    # Resumable progress tracker for the MOS archive ingestion script.
+    # One row per (model, station, runtime_utc). Status values:
+    # 'pending', 'completed', 'no_data', 'failed'.
+    """
+    CREATE TABLE IF NOT EXISTS nws_archive_progress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model TEXT NOT NULL,
+        station_id TEXT NOT NULL,
+        runtime_utc TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        rows_inserted INTEGER NOT NULL DEFAULT 0,
+        attempted_at TEXT,
+        completed_at TEXT,
+        error_message TEXT,
+        UNIQUE(model, station_id, runtime_utc)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_nws_archive_status
+        ON nws_archive_progress(status)
+    """,
 )
 
 
@@ -248,27 +337,60 @@ SCHEMA: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
-    """Return a sqlite connection with WAL + project-wide pragmas."""
-    path = db_path or DB_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
-    conn.execute("PRAGMA busy_timeout=30000")
+    """Return a sqlite connection to forecast_ml.db.
+
+    Delegates to the shared ``db_utils.get_connection`` for the WAL + busy
+    pragmas, then adds ``foreign_keys=ON`` which this project's schema relies
+    on (``forecast_verification`` references ``production_forecast``).
+    """
+    conn = db_utils.get_connection(db_path or DB_PATH)
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent in-place migrations for older DBs predating new columns.
+
+    SQLite ``ALTER TABLE ADD COLUMN`` is itself idempotent only via the
+    ``duplicate column`` error swallow below; we cannot use
+    ``IF NOT EXISTS`` because that clause does not exist for ADD COLUMN.
+    """
+    migrations = [
+        # Phase 7: A/B variant column on model_runs (default 'baseline').
+        "ALTER TABLE model_runs ADD COLUMN variant TEXT NOT NULL DEFAULT 'baseline'",
+    ]
+    for stmt in migrations:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            # Fresh DB: target table doesn't exist yet — SCHEMA loop creates
+            # it with the column already present, so the migration is moot.
+            # Old DB: column already exists from a prior migration run.
+            if (
+                "duplicate column" in msg
+                or "already exists" in msg
+                or "no such table" in msg
+            ):
+                continue
+            raise
 
 
 def init_db(db_path: Path | None = None) -> Path:
     """Create the schema if it does not already exist.
 
-    Idempotent — safe to call from any script. Returns the resolved DB path.
+    Idempotent — safe to call from any script. Applies in-place migrations
+    for older DBs. Returns the resolved DB path.
     """
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = get_connection(path)
     try:
+        # Migrations first: ensure new columns exist on legacy tables before
+        # the SCHEMA loop tries to create indexes that reference them. The
+        # migration helper is a no-op for fresh DBs (the CREATE TABLE in
+        # SCHEMA already includes the new columns).
+        _apply_migrations(conn)
         for stmt in SCHEMA:
             conn.execute(stmt)
         conn.commit()

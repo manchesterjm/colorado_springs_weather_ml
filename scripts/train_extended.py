@@ -12,13 +12,8 @@ import argparse
 import sys
 from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from forecast_ml_pkg.io import setup_utf8_stdout  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.trainer_extended import (  # noqa: E402  pylint: disable=wrong-import-position
+from forecast_ml_pkg.externals import setup_utf8_stdout
+from forecast_ml_pkg.trainer_extended import (
     ARTIFACT_DIR, ExtendedForecastTrainer, ExtendedTrainerConfig,
 )
 
@@ -51,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         "--artifact",
         help="Output artifact path (default model_runs/extended_v1.pkl)",
     )
+    p.add_argument(
+        "--use-nws-features", action="store_true",
+        help="Append 28 NWS Hi/Lo/PoP/availability columns (Phase 7 variant)",
+    )
+    p.add_argument(
+        "--no-model-runs-row", action="store_true",
+        help="Skip writing a model_runs row (use for evaluation-only runs)",
+    )
     return p.parse_args()
 
 
@@ -72,6 +75,8 @@ def main() -> int:
         neighbor_stations=neighbors,
         classifier_kind=args.classifier,
         artifact_path=artifact_path,
+        use_nws_features=args.use_nws_features,
+        write_model_runs_row=not args.no_model_runs_row,
     )
 
     trainer = ExtendedForecastTrainer(cfg)

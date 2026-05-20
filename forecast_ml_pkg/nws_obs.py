@@ -18,10 +18,9 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from forecast_ml_pkg import constants
 
-USER_AGENT = "forecast_ml_pkg/0.1 (manchesterjm@gmail.com)"
-TIMEOUT_SEC = 30
+logger = logging.getLogger(__name__)
 
 # Unit conversions (NWS API native -> our schema)
 KMH_TO_KNOTS = 0.539957
@@ -50,9 +49,12 @@ def _value_in(prop: Optional[dict], expected_unit: str) -> Optional[float]:
 def fetch_latest(icao: str) -> Optional[dict[str, Any]]:
     """Fetch the latest NWS observation JSON for one station. Returns ``None`` on 404."""
     url = f"https://api.weather.gov/stations/{icao}/observations/latest"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/geo+json"})
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": constants.HTTP_USER_AGENT, "Accept": "application/geo+json"},
+    )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+        with urllib.request.urlopen(req, timeout=constants.HTTP_TIMEOUT_SEC) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:

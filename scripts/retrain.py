@@ -20,15 +20,9 @@ from __future__ import annotations
 import sys
 import time
 from datetime import date, timedelta
-from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from forecast_ml_pkg.io import setup_utf8_stdout  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.trainer_extended import (  # noqa: E402  pylint: disable=wrong-import-position
+from forecast_ml_pkg.externals import setup_utf8_stdout
+from forecast_ml_pkg.trainer_extended import (
     ARTIFACT_DIR, ExtendedForecastTrainer, ExtendedTrainerConfig,
 )
 
@@ -61,25 +55,35 @@ def main() -> int:
     print(f"  Cal window:  {val_start} ... {val_end}")
     print()
 
-    artifact_path = ARTIFACT_DIR / f"extended_prod_{today}.pkl"
-    cfg = ExtendedTrainerConfig(
-        horizons=(1, 2, 3, 4, 5, 6, 7),
-        train_end=train_end,
-        val_start=val_start,
-        val_end=val_end,
-        test_start=None,
-        test_end=None,
-        neighbor_stations=("KPUB", "KDEN", "KAPA"),
-        classifier_kind="histgbm",
-        artifact_path=artifact_path,
-        write_model_runs_row=True,
+    # A/B retrain: both variants share the same window so the comparison stays
+    # apples-to-apples. The trainer demotes only same-variant rows in
+    # model_runs, so each variant ends with exactly one is_active=1 row.
+    variants = (
+        ("baseline", False, f"extended_prod_{today}.pkl"),
+        ("nwsfeat",  True,  f"extended_prod_nwsfeat_{today}.pkl"),
     )
-
-    t0 = time.time()
-    trainer = ExtendedForecastTrainer(cfg)
-    trainer.run()
-    elapsed = time.time() - t0
-    print(f"\nRetrain complete in {elapsed:.1f} s")
+    total_t0 = time.time()
+    for label, use_nws, fname in variants:
+        print(f"\n=== variant: {label} (use_nws_features={use_nws}) ===")
+        artifact_path = ARTIFACT_DIR / fname
+        cfg = ExtendedTrainerConfig(
+            horizons=(1, 2, 3, 4, 5, 6, 7),
+            train_end=train_end,
+            val_start=val_start,
+            val_end=val_end,
+            test_start=None,
+            test_end=None,
+            neighbor_stations=("KPUB", "KDEN", "KAPA"),
+            classifier_kind="histgbm",
+            artifact_path=artifact_path,
+            write_model_runs_row=True,
+            use_nws_features=use_nws,
+        )
+        t0 = time.time()
+        trainer = ExtendedForecastTrainer(cfg)
+        trainer.run()
+        print(f"  {label} retrain complete in {time.time() - t0:.1f} s")
+    print(f"\nA/B retrain complete in {time.time() - total_t0:.1f} s")
     return 0
 
 

@@ -1,6 +1,7 @@
 # Data and runtime artifacts (regenerable)
 data/
 reports/
+graphify-out/
 
 # Python
 __pycache__/

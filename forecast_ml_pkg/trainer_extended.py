@@ -36,8 +36,6 @@ from __future__ import annotations
 
 import json
 import pickle
-import sqlite3
-import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,23 +43,17 @@ from typing import Optional
 
 import numpy as np
 
-# Make the project root importable when invoked as a script.
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import db as fdb
+from forecast_ml_pkg import continuous_models as cm
+from forecast_ml_pkg import nws_features as nwsf
+from forecast_ml_pkg.externals import tz_utils
 
-from forecast_ml_pkg import db as fdb  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg import continuous_models as cm  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-# weather_regime_pkg lives under D:\Scripts; the forecast_ml_pkg.io shim
-# puts that on sys.path on import.
-from weather_regime_pkg.trainer import (  # noqa: E402  pylint: disable=wrong-import-position
+# weather_regime_pkg lives under D:\Scripts; forecast_ml_pkg/__init__.py
+# puts that directory on sys.path at import time.
+from weather_regime_pkg.trainer import (
     RegimeForecastTrainer, TrainerConfig,
 )
-from weather_regime_pkg.features import targets_for_horizon  # noqa: E402  pylint: disable=wrong-import-position
-
+from weather_regime_pkg.features import targets_for_horizon
 
 PROJECT_ROOT = fdb.PROJECT_ROOT
 ARTIFACT_DIR = PROJECT_ROOT / "data" / "model_runs"
@@ -86,6 +78,11 @@ class ExtendedTrainerConfig:
     artifact_path: Path = ARTIFACT_DIR / "extended_v1.pkl"
     write_model_runs_row: bool = True
     extra_artifact_fields: dict = field(default_factory=dict)
+    # Phase 7 (NWS-as-feature). When True, appends 28 NWS columns to the
+    # autoregressive feature matrix: 7 Hi + 7 Lo + 7 PoP + 7 availability
+    # indicators. The model version label gains a "-nwsfeat" suffix so the
+    # registry can host both variants side-by-side.
+    use_nws_features: bool = False
 
 
 class ExtendedForecastTrainer(RegimeForecastTrainer):
@@ -111,6 +108,14 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
         self.lo_models: dict[int, object] = {}
         self.pop_models: dict[int, object] = {}
         self.metrics_per_h: dict[int, dict] = {}
+        # Phase 7 climatology arrays (populated by augment_with_nws_features).
+        self.nws_hi_clim: Optional[np.ndarray] = None
+        self.nws_lo_clim: Optional[np.ndarray] = None
+        # Built by the parent's build_dataset(); augment_with_nws_features()
+        # may extend them. Declared here so they are not assigned only
+        # "outside __init__".
+        self.X: Optional[np.ndarray] = None
+        self.feature_names: list = []
 
     # ----------------------------------------------------------------
     # Per-horizon Hi/Lo/PoP fit + evaluate
@@ -160,11 +165,48 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
     # Orchestration
     # ----------------------------------------------------------------
 
+    def augment_with_nws_features(self) -> None:
+        """Append the 28 NWS columns to ``self.X`` and ``self.feature_names``.
+
+        Climatology is computed from training-period rows only (rows whose date
+        is <= ``cfg.train_end``) to prevent leakage. Coverage stats are logged
+        so downstream callers know how many anchors fell back to imputation.
+        """
+        cfg = self.config
+        train_rows = [r for r in self.rows if r["date"] <= cfg.train_end]
+        hi_clim, lo_clim = nwsf.doy_hi_lo_climatology(train_rows)
+        self.nws_hi_clim = hi_clim
+        self.nws_lo_clim = lo_clim
+
+        anchor_dates = [self.rows[i]["date"] for i in self.valid_idx]
+        if anchor_dates:
+            lookup = nwsf.load_mex_lookup(
+                start_anchor=min(anchor_dates),
+                end_anchor=max(anchor_dates),
+            )
+        else:
+            lookup = {}
+
+        nws_X, n_real, n_imp = nwsf.build_nws_feature_matrix(
+            self.rows, self.valid_idx, lookup, hi_clim, lo_clim,
+        )
+        self.X = np.hstack([self.X, nws_X])
+        self.feature_names = list(self.feature_names) + nwsf.nws_feature_names()
+        n_total = len(self.valid_idx)
+        coverage = (n_real / n_total) if n_total else 0.0
+        print(
+            f"NWS features appended: +{nws_X.shape[1]} cols; "
+            f"anchors covered={n_real}/{n_total} ({coverage:.1%}), "
+            f"any-imputation rows={n_imp}"
+        )
+
     def run(self) -> dict:  # pylint: disable=too-many-locals
         cfg = self.config
         ext_cfg = self.ext_config
         self.load_data()
         self.build_dataset()
+        if ext_cfg.use_nws_features:
+            self.augment_with_nws_features()
 
         regime_models: dict[int, object] = {}
         regime_results: dict[int, dict] = {}
@@ -241,6 +283,9 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
             "test_window": (cfg.test_start, cfg.test_end) if cfg.test_start else None,
             "metrics": self.metrics_per_h,
             "classifier_kind": cfg.classifier_kind,
+            "use_nws_features": ext_cfg.use_nws_features,
+            "nws_hi_clim": self.nws_hi_clim,
+            "nws_lo_clim": self.nws_lo_clim,
         }
         artifact.update(ext_cfg.extra_artifact_fields)
 
@@ -255,7 +300,11 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
         cfg = self.config
         ext_cfg = self.ext_config
         run_id = uuid.uuid4().hex[:12]
-        model_version = f"extended-{ext_cfg.classifier_kind}-{tz_utils.now_utc()[:10]}"
+        suffix = "-nwsfeat" if ext_cfg.use_nws_features else ""
+        variant = "nwsfeat" if ext_cfg.use_nws_features else "baseline"
+        model_version = (
+            f"extended-{ext_cfg.classifier_kind}{suffix}-{tz_utils.now_utc()[:10]}"
+        )
 
         hyperparams = {
             "regime_params": (
@@ -283,15 +332,20 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
         conn = fdb.get_connection()
         try:
             with conn:
-                conn.execute("UPDATE model_runs SET is_active = 0")
+                # Demote only the current variant; the other variant (if any)
+                # stays active so A/B keeps running.
+                conn.execute(
+                    "UPDATE model_runs SET is_active = 0 WHERE variant = ?",
+                    (variant,),
+                )
                 conn.execute(
                     """
                     INSERT INTO model_runs (
                         run_id, model_version, training_start_date, training_end_date,
                         val_start_date, val_end_date,
                         hyperparams_json, val_metrics_json, feature_names_json,
-                        artifact_path, created_at, is_active
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        artifact_path, created_at, is_active, variant
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                     """,
                     (
                         run_id, model_version,
@@ -303,6 +357,7 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
                         json.dumps(self.feature_names),
                         str(artifact_path),
                         tz_utils.now_utc(),
+                        variant,
                     ),
                 )
         finally:

@@ -21,7 +21,6 @@ import io as _stdlib_io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -81,7 +80,7 @@ ICAO_INDEX: dict[str, Station] = {s.icao: s for s in STATIONS}
 # NCEI ISD has multiple records per ICAO when stations were re-registered.
 # We pick the one whose end-date is most recent (active or recently active).
 # Cached on first lookup.
-_isd_cache: Optional[dict[str, tuple[str, str]]] = None  # icao -> (usaf, wban)
+_isd_cache: dict[str, tuple[str, str]] = {}  # icao -> (usaf, wban); empty = unloaded
 
 
 def get_station(icao: str) -> Station:
@@ -148,9 +147,8 @@ def get_isd_id(icao: str, cache_path: Path) -> tuple[str, str]:
     Returns:
         Tuple of (USAF id, WBAN id) — both as strings (preserve leading zeros).
     """
-    global _isd_cache
-    if _isd_cache is None:
-        _isd_cache = load_isd_history(cache_path)
+    if not _isd_cache:
+        _isd_cache.update(load_isd_history(cache_path))
     icao = icao.upper()
     if icao not in _isd_cache:
         raise KeyError(f"No NCEI ISD entry found for ICAO {icao!r}")

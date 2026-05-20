@@ -17,7 +17,7 @@ one X and one set of valid_idx / split masks.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Optional
+from typing import Iterable
 
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV

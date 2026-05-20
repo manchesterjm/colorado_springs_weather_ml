@@ -29,19 +29,12 @@ import sys
 import time
 import urllib.error
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-# Make the package importable when running as a plain script.
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import db, ncei_isd, netfetch, stations
+from forecast_ml_pkg.externals import tz_utils
 
-from forecast_ml_pkg import db, ncei_isd, stations  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-LOG_PATH = _ROOT / "data" / "metar_ncei_backfill.log"
+LOG_PATH = db.PROJECT_ROOT / "data" / "metar_ncei_backfill.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -105,21 +98,15 @@ def fetch_with_retry(usaf: str, wban: str, year: int) -> tuple[Optional[str], st
 
     Status: 'ok' (got CSV), 'no_data' (404), 'failed' (transient errors exhausted).
     """
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            csv_text = ncei_isd.fetch_year_csv(usaf, wban, year)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            wait = RETRY_BACKOFF_SEC * attempt
-            logger.warning(
-                "Fetch error %s/%s/%d (attempt %d/%d): %s; sleeping %ds",
-                usaf, wban, year, attempt, MAX_RETRIES, exc, wait,
-            )
-            time.sleep(wait)
-            continue
-        if csv_text is None:
-            return None, "no_data"
-        return csv_text, "ok"
-    return None, "failed"
+    try:
+        csv_text = netfetch.fetch_with_retry(
+            lambda: ncei_isd.fetch_year_csv(usaf, wban, year),
+            retries=MAX_RETRIES, backoff_sec=RETRY_BACKOFF_SEC,
+            label=f"Fetch {usaf}/{wban}/{year}", logger=logger,
+        )
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None, "failed"
+    return (csv_text, "ok") if csv_text is not None else (None, "no_data")
 
 
 # ---------------------------------------------------------------------------

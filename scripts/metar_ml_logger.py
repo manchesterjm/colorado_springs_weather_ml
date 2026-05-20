@@ -16,20 +16,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 import sys
-import time
 import urllib.error
-from pathlib import Path
 from typing import Optional
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import db, netfetch, nws_obs, stations
+from forecast_ml_pkg.externals import script_metrics, tz_utils
 
-from forecast_ml_pkg import db, nws_obs, stations  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import script_metrics, tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-LOG_PATH = _ROOT / "data" / "metar_ml_logger.log"
+LOG_PATH = db.PROJECT_ROOT / "data" / "metar_ml_logger.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -45,17 +38,14 @@ RETRY_BACKOFF_SEC = 5
 
 def fetch_with_retry(icao: str) -> Optional[dict]:
     """Fetch an observation JSON with bounded retry on transient errors."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return nws_obs.fetch_latest(icao)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            wait = RETRY_BACKOFF_SEC * attempt
-            logger.warning(
-                "fetch %s attempt %d/%d failed: %s; sleeping %ds",
-                icao, attempt, MAX_RETRIES, exc, wait,
-            )
-            time.sleep(wait)
-    return None
+    try:
+        return netfetch.fetch_with_retry(
+            lambda: nws_obs.fetch_latest(icao),
+            retries=MAX_RETRIES, backoff_sec=RETRY_BACKOFF_SEC,
+            label=f"fetch {icao}", logger=logger,
+        )
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
 
 
 def insert_observation(

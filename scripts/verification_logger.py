@@ -24,27 +24,17 @@ import pickle
 import sqlite3
 import sys
 from datetime import date
-from pathlib import Path
 from typing import Optional
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import db as fdb
+from forecast_ml_pkg.externals import db_utils, tz_utils
 
-from forecast_ml_pkg import db as fdb  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-from weather_regime_pkg import STATE_LABELS, doy  # noqa: E402  pylint: disable=wrong-import-position
-from weather_regime_pkg.state_classifier import (  # noqa: E402  pylint: disable=wrong-import-position
-    PRECIP_DRY_MAX, PRECIP_LIGHT_MAX, precip_tier, temp_tier,
+from weather_regime_pkg import STATE_LABELS, doy
+from weather_regime_pkg.state_classifier import (
+    PRECIP_DRY_MAX, precip_tier, temp_tier,
 )
 
-WEATHER_DB = (
-    Path(r"D:\Scripts\weather_data\weather.db") if sys.platform == "win32"
-    else Path("/mnt/d/Scripts/weather_data/weather.db")
-)
-LOG_PATH = _ROOT / "data" / "verification_logger.log"
+LOG_PATH = fdb.PROJECT_ROOT / "data" / "verification_logger.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -70,7 +60,7 @@ def _label_to_state(label: str) -> Optional[int]:
 
 def fetch_actual_kcos(target_date: str) -> Optional[dict]:
     """Return ``{maxt, mint, pcpn}`` for the date or None if not yet recorded."""
-    conn = sqlite3.connect(WEATHER_DB)
+    conn = sqlite3.connect(db_utils.DB_PATH)
     try:
         row = conn.execute(
             "SELECT max_temp_f, min_temp_f, precip_in, is_precip_trace "
@@ -138,7 +128,7 @@ def pending_forecasts(conn: sqlite3.Connection, today: str) -> list[dict]:
 def write_verification(
     conn: sqlite3.Connection, forecast_id: int, target_date: str,
     actual: dict, actual_state: Optional[int],
-    forecast_row: dict, terciles: dict,
+    forecast_row: dict,
 ) -> None:
     probs = json.loads(forecast_row["regime_probs_json"])
     forecast_top1 = _label_to_state(forecast_row["regime_top1"])
@@ -233,7 +223,7 @@ def main() -> int:
                 actual_state = classify_actual(actual, terciles, pf["target_date_local"])
                 write_verification(
                     conn, pf["id"], pf["target_date_local"], actual, actual_state,
-                    pf, terciles,
+                    pf,
                 )
                 written += 1
                 actual_label = STATE_LABELS[actual_state] if actual_state is not None else "?"

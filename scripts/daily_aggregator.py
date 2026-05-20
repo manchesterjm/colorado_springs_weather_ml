@@ -38,19 +38,13 @@ import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Iterable, Optional
-from zoneinfo import ZoneInfo
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from forecast_ml_pkg import db, stations
+from forecast_ml_pkg.dates import DENVER
+from forecast_ml_pkg.externals import tz_utils
 
-from forecast_ml_pkg import db, stations  # noqa: E402  pylint: disable=wrong-import-position
-from forecast_ml_pkg.io import tz_utils  # noqa: E402  pylint: disable=wrong-import-position
-
-LOG_PATH = _ROOT / "data" / "daily_aggregator.log"
+LOG_PATH = db.PROJECT_ROOT / "data" / "daily_aggregator.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -60,7 +54,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("daily_aggregator")
 
-DENVER = ZoneInfo("America/Denver")
 PRECIP_HOUR_THRESHOLD_IN = 0.005  # Trace cutoff for "hour with precip"
 
 

@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import io
 import json
-import sqlite3
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -20,8 +18,8 @@ import numpy as np
 
 from weather_regime_pkg import STATE_LABELS
 
-from . import db as fdb
-from .io import tz_utils
+from . import db as fdb, fmt
+from .externals import tz_utils
 
 
 @dataclass
@@ -70,13 +68,13 @@ class ForecastResult:
 def render_text(result: ForecastResult) -> str:
     """Plain-text terminal-friendly summary."""
     buf = io.StringIO()
-    bar = "=" * 90
-    print(bar, file=buf)
+    rule = "=" * 90
+    print(rule, file=buf)
     print(f"COLORADO SPRINGS WEATHER ML FORECAST — issued {result.issue_time}", file=buf)
-    print(bar, file=buf)
+    print(rule, file=buf)
     print(f"Anchor day:   {result.anchor_date_local}  state={result.anchor_state_label}  "
-          f"Hi={_fmt_f(result.anchor_hi_f)}  Lo={_fmt_f(result.anchor_lo_f)}  "
-          f"precip={_fmt_in(result.anchor_precip_in)}", file=buf)
+          f"Hi={fmt.temp(result.anchor_hi_f)}  Lo={fmt.temp(result.anchor_lo_f)}  "
+          f"precip={fmt.inches(result.anchor_precip_in)}", file=buf)
     print(f"Model:        {result.model_version}  (run {result.model_run_id})", file=buf)
     print(f"NWS issued:   {result.nws_fetch_time or 'n/a'}", file=buf)
     print(file=buf)
@@ -92,12 +90,12 @@ def render_text(result: ForecastResult) -> str:
         ptop = fc.regime_probs[fc.regime_top1]
         print(f"{fc.target_date_local:12s} {fc.weekday:10s} {fc.horizon_days:1d}  "
               f"{fc.regime_top1_label:12s} {ptop:>5.2f}  "
-              f"{_fmt_f(fc.hi_f_ml, w=5):>5s} {_fmt_f(fc.lo_f_ml, w=5):>5s} "
-              f"{_fmt_pct(fc.pop_ml):>5s}  "
-              f"{_fmt_f(fc.nws_hi_f, w=6):>6s} {_fmt_f(fc.nws_lo_f, w=6):>6s} "
-              f"{_fmt_pct_int(fc.nws_pop):>5s}  "
-              f"{_fmt_f(fc.blend_hi_f, w=7):>7s} {_fmt_f(fc.blend_lo_f, w=7):>7s} "
-              f"{_fmt_pct(fc.blend_pop):>8s}",
+              f"{fmt.temp(fc.hi_f_ml):>5s} {fmt.temp(fc.lo_f_ml):>5s} "
+              f"{fmt.pct_from_fraction(fc.pop_ml):>5s}  "
+              f"{fmt.temp(fc.nws_hi_f):>6s} {fmt.temp(fc.nws_lo_f):>6s} "
+              f"{fmt.pct_from_whole(fc.nws_pop):>5s}  "
+              f"{fmt.temp(fc.blend_hi_f):>7s} {fmt.temp(fc.blend_lo_f):>7s} "
+              f"{fmt.pct_from_fraction(fc.blend_pop):>8s}",
               file=buf)
     print(file=buf)
     return buf.getvalue()
@@ -110,13 +108,13 @@ def render_text(result: ForecastResult) -> str:
 def render_markdown(result: ForecastResult) -> str:
     """Markdown report — one self-contained file per issue date."""
     buf = io.StringIO()
-    print(f"# Colorado Springs Weather ML Forecast", file=buf)
+    print("# Colorado Springs Weather ML Forecast", file=buf)
     print(f"\n**Issued:** {result.issue_time}  ", file=buf)
     print(f"**Anchor:** {result.anchor_date_local} "
           f"({result.anchor_state_label}; "
-          f"Hi {_fmt_f(result.anchor_hi_f)}, "
-          f"Lo {_fmt_f(result.anchor_lo_f)}, "
-          f"precip {_fmt_in(result.anchor_precip_in)})  ", file=buf)
+          f"Hi {fmt.temp(result.anchor_hi_f)}, "
+          f"Lo {fmt.temp(result.anchor_lo_f)}, "
+          f"precip {fmt.inches(result.anchor_precip_in)})  ", file=buf)
     print(f"**Model:** {result.model_version} (run {result.model_run_id})  ", file=buf)
     print(f"**NWS source:** {result.nws_fetch_time or 'unavailable'}", file=buf)
     print(file=buf)
@@ -130,12 +128,12 @@ def render_markdown(result: ForecastResult) -> str:
         print("| "
               f"{fc.target_date_local} | {fc.weekday} | {fc.horizon_days} | "
               f"{fc.regime_top1_label} | {ptop:.2f} | "
-              f"{_fmt_f(fc.hi_f_ml)} | {_fmt_f(fc.lo_f_ml)} | "
-              f"{_fmt_pct(fc.pop_ml)} | "
-              f"{_fmt_f(fc.nws_hi_f)} | {_fmt_f(fc.nws_lo_f)} | "
-              f"{_fmt_pct_int(fc.nws_pop)} | "
-              f"{_fmt_f(fc.blend_hi_f)} | {_fmt_f(fc.blend_lo_f)} | "
-              f"{_fmt_pct(fc.blend_pop)} |", file=buf)
+              f"{fmt.temp(fc.hi_f_ml)} | {fmt.temp(fc.lo_f_ml)} | "
+              f"{fmt.pct_from_fraction(fc.pop_ml)} | "
+              f"{fmt.temp(fc.nws_hi_f)} | {fmt.temp(fc.nws_lo_f)} | "
+              f"{fmt.pct_from_whole(fc.nws_pop)} | "
+              f"{fmt.temp(fc.blend_hi_f)} | {fmt.temp(fc.blend_lo_f)} | "
+              f"{fmt.pct_from_fraction(fc.blend_pop)} |", file=buf)
     print(file=buf)
     print("## Top-3 regime probabilities", file=buf)
     print(file=buf)
@@ -158,6 +156,82 @@ def write_markdown_report(result: ForecastResult, reports_dir: Path) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     path = reports_dir / f"{result.issue_date_local}.md"
     path.write_text(render_markdown(result), encoding="utf-8")
+    return path
+
+
+def render_multi_variant_markdown(results: list[ForecastResult]) -> str:
+    """Combine multiple variants into a single markdown report.
+
+    Each variant gets its own ``## <variant>`` section reusing
+    ``render_markdown`` for the table body. A shared header block at the top
+    records the anchor and NWS fetch time once (variants share them).
+    """
+    if not results:
+        return ""
+    head = results[0]
+    buf = io.StringIO()
+    print("# Colorado Springs Weather ML Forecast", file=buf)
+    print(f"\n**Issued:** {head.issue_time}  ", file=buf)
+    print(
+        f"**Anchor:** {head.anchor_date_local} "
+        f"({head.anchor_state_label}; "
+        f"Hi {fmt.temp(head.anchor_hi_f)}, "
+        f"Lo {fmt.temp(head.anchor_lo_f)}, "
+        f"precip {fmt.inches(head.anchor_precip_in)})  ", file=buf,
+    )
+    print(f"**NWS source:** {head.nws_fetch_time or 'unavailable'}  ", file=buf)
+    print(f"**Variants:** {', '.join(r.model_version for r in results)}", file=buf)
+    print(file=buf)
+    for r in results:
+        # Use the model_version suffix as the section name when available so
+        # readers can tell apart baseline / nwsfeat / future variants.
+        variant_tag = r.model_version
+        print(f"## {variant_tag}", file=buf)
+        print(file=buf)
+        # Inline a model-specific snippet (re-rendering avoids re-emitting the
+        # shared header block).
+        print(f"_Run id_: {r.model_run_id}", file=buf)
+        print(file=buf)
+        print(
+            "| Date | Day | h | ML regime | p | ML Hi | ML Lo | ML PoP "
+            "| NWS Hi | NWS Lo | NWS PoP | Blend Hi | Blend Lo | Blend PoP |",
+            file=buf,
+        )
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|", file=buf)
+        for fc in r.horizons:
+            ptop = fc.regime_probs[fc.regime_top1]
+            print(
+                "| "
+                f"{fc.target_date_local} | {fc.weekday} | {fc.horizon_days} | "
+                f"{fc.regime_top1_label} | {ptop:.2f} | "
+                f"{fmt.temp(fc.hi_f_ml)} | {fmt.temp(fc.lo_f_ml)} | "
+                f"{fmt.pct_from_fraction(fc.pop_ml)} | "
+                f"{fmt.temp(fc.nws_hi_f)} | {fmt.temp(fc.nws_lo_f)} | "
+                f"{fmt.pct_from_whole(fc.nws_pop)} | "
+                f"{fmt.temp(fc.blend_hi_f)} | {fmt.temp(fc.blend_lo_f)} | "
+                f"{fmt.pct_from_fraction(fc.blend_pop)} |",
+                file=buf,
+            )
+        print(file=buf)
+    # NWS short-text is variant-invariant; emit once from the head result.
+    if any(fc.nws_text for fc in head.horizons):
+        print("## NWS short-text", file=buf)
+        print(file=buf)
+        for fc in head.horizons:
+            if fc.nws_text:
+                print(f"- **{fc.target_date_local}**: {fc.nws_text}", file=buf)
+        print(file=buf)
+    return buf.getvalue()
+
+
+def write_multi_variant_report(
+    results: list[ForecastResult], reports_dir: Path,
+) -> Path:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    if not results:
+        raise ValueError("write_multi_variant_report needs at least one result")
+    path = reports_dir / f"{results[0].issue_date_local}.md"
+    path.write_text(render_multi_variant_markdown(results), encoding="utf-8")
     return path
 
 
@@ -229,39 +303,13 @@ def write_to_db(result: ForecastResult) -> int:
     return inserted
 
 
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-def _fmt_f(v: Optional[float], w: int = 0) -> str:
-    if v is None:
-        return "--"
-    return f"{v:.0f}"
-
-
-def _fmt_in(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"{v:.2f}\""
-
-
-def _fmt_pct(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"{int(round(v * 100)):d}%"
-
-
-def _fmt_pct_int(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"{int(round(v)):d}%"
-
-
 __all__ = [
     "HorizonForecast",
     "ForecastResult",
     "render_text",
     "render_markdown",
+    "render_multi_variant_markdown",
     "write_markdown_report",
+    "write_multi_variant_report",
     "write_to_db",
 ]
