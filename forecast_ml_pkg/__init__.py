@@ -13,7 +13,7 @@ from pathlib import Path
 # moment the package is loaded -- this is what lets us reuse db_utils,
 # tz_utils, script_metrics, and weather_regime_pkg without per-module
 # sys.path tinkering.
-_SCRIPTS_DIR = Path(r"D:\Scripts") if sys.platform == "win32" else Path("/mnt/d/Scripts")
+_SCRIPTS_DIR = Path(r"D:\Scripts") if sys.platform == "win32" else Path("/mnt/d/scripts")
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 

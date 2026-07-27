@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime
+import sqlite3
+from datetime import date, datetime
 from typing import Optional
 
 import numpy as np
@@ -23,24 +24,84 @@ from forecast_ml_pkg.externals import tz_utils
 logger = logging.getLogger(__name__)
 
 
+def _advance_anchor_with_metar(
+    rows: list[dict],
+    station_id: str,
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Splice fresh METAR-derived daily rows in so a stale ACIS anchor advances.
+
+    ACIS daily climate publishes ~1-2 days late, which would otherwise pin the
+    forecast anchor two days back -- so "h=1" lands on a date already in the past.
+    The ``daily_summary`` table (METAR-derived, refreshed nightly) usually already
+    has those missing days; we splice each *complete* past day ACIS still lacks,
+    converted to the ACIS row shape and units (degF).
+
+    Only the anchor day itself ends up METAR-sourced -- its lag days stay ACIS --
+    so the known ~1 degF METAR-vs-ACIS sampling skew touches a single recent
+    feature, a small price for advancing the anchor a full day.
+    """
+    last_complete = max(
+        (r["date"] for r in rows
+         if r["maxt"] is not None and r["mint"] is not None),
+        default=None,
+    )
+    if last_complete is None:
+        return rows
+    today = date.today().isoformat()
+    cur = conn.execute(
+        "SELECT date_local, tmax_c, tmin_c, precip_in FROM daily_summary "
+        "WHERE station_id=? AND date_local>? AND date_local<? "
+        "AND tmax_c IS NOT NULL AND tmin_c IS NOT NULL AND hours_observed>=20 "
+        "ORDER BY date_local",
+        (station_id, last_complete, today),
+    )
+    bridge = [
+        {"date": d,
+         "maxt": round(tmax_c * 9 / 5 + 32, 1),
+         "mint": round(tmin_c * 9 / 5 + 32, 1),
+         "pcpn": pcpn if pcpn is not None else 0.0}
+        for d, tmax_c, tmin_c, pcpn in cur.fetchall()
+    ]
+    if not bridge:
+        return rows
+    bridged_dates = {b["date"] for b in bridge}
+    merged = [r for r in rows if r["date"] not in bridged_dates]
+    merged.extend(bridge)
+    merged.sort(key=lambda r: r["date"])
+    logger.info(
+        "Anchor bridge %s: ACIS through %s + METAR daily %s",
+        station_id, last_complete, sorted(bridged_dates),
+    )
+    return merged
+
+
 def load_classified_data(
     artifact: dict,
 ) -> tuple[list[dict], dict[str, dict]]:
     """Load KCOS + neighbors, classify in place using artifact's terciles.
 
+    Each station's ACIS history is first bridged with fresh METAR-derived daily
+    rows (see ``_advance_anchor_with_metar``) so the anchor reflects the most
+    recent complete day rather than ACIS's ~2-day-late publication.
+
     Returns ``(kcos_rows, neighbor_lookups)`` where ``neighbor_lookups`` is
     ``{station_id: {date: row}}``.
     """
-    rows = fetch_acis("KCOS")
-    classify(rows, artifact["terciles"])
+    conn = fdb.get_connection()
+    try:
+        rows = _advance_anchor_with_metar(fetch_acis("KCOS"), "KCOS", conn)
+        classify(rows, artifact["terciles"])
 
-    neighbor_lookups: dict[str, dict] = {}
-    for sid in artifact.get("neighbor_stations", []):
-        nrows = fetch_acis(sid)
-        n_terc = artifact["neighbor_terciles"].get(sid)
-        if n_terc:
-            classify(nrows, n_terc)
-        neighbor_lookups[sid] = {r["date"]: r for r in nrows}
+        neighbor_lookups: dict[str, dict] = {}
+        for sid in artifact.get("neighbor_stations", []):
+            nrows = _advance_anchor_with_metar(fetch_acis(sid), sid, conn)
+            n_terc = artifact["neighbor_terciles"].get(sid)
+            if n_terc:
+                classify(nrows, n_terc)
+            neighbor_lookups[sid] = {r["date"]: r for r in nrows}
+    finally:
+        conn.close()
 
     return rows, neighbor_lookups
 

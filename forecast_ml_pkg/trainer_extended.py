@@ -122,7 +122,20 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
     # ----------------------------------------------------------------
 
     def fit_continuous_heads_for_horizon(self, h: int) -> dict:
-        """Fit Hi, Lo, PoP heads for one horizon. Returns the metrics dict."""
+        """Fit Hi, Lo, PoP heads for one horizon. Returns the metrics dict.
+
+        Scores are computed on the held-out **test** window when one is
+        configured. Production retrain runs with ``test_start=None`` (no test
+        split, so the active model calibrates on the widest recent window), and
+        in that mode the heads are scored on the **validation/calibration**
+        window instead -- otherwise the metrics are taken over an empty array
+        and come out NaN, which is what previously left ``val_metrics_json``
+        unusable. Hi/Lo are genuinely held out (only the train split is fit);
+        PoP is calibrated on the val window, so its val-fallback Brier/ECE are
+        mildly optimistic in absolute terms but stay apples-to-apples across the
+        baseline/nwsfeat A/B variants (both scored the same way). The model
+        artifact itself is unaffected -- this only governs what gets scored.
+        """
         y_hi, y_lo, y_pop, hi_lo_mask = cm.build_continuous_targets(
             self.rows, self.valid_idx, h, self.ext_config.pop_threshold_in,
         )
@@ -130,23 +143,26 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
         val_idx = self.val_m & hi_lo_mask
         test_idx = self.test_m & hi_lo_mask
 
+        # Prefer the held-out test window; fall back to val when none exists.
+        eval_idx = test_idx if int(test_idx.sum()) > 0 else val_idx
+
         X_train = self.X[train_idx]
         X_val = self.X[val_idx]
-        X_test = self.X[test_idx]
+        X_eval = self.X[eval_idx]
 
         # Hi
         hi_reg = cm.fit_hi_lo_regressor(X_train, y_hi[train_idx], self.cat_indices)
-        hi_metrics = cm.evaluate_hi_lo(hi_reg, X_test, y_hi[test_idx])
+        hi_metrics = cm.evaluate_hi_lo(hi_reg, X_eval, y_hi[eval_idx])
 
         # Lo
         lo_reg = cm.fit_hi_lo_regressor(X_train, y_lo[train_idx], self.cat_indices)
-        lo_metrics = cm.evaluate_hi_lo(lo_reg, X_test, y_lo[test_idx])
+        lo_metrics = cm.evaluate_hi_lo(lo_reg, X_eval, y_lo[eval_idx])
 
         # PoP
         pop_cal, pop_base = cm.fit_pop_classifier(
             X_train, y_pop[train_idx], X_val, y_pop[val_idx], self.cat_indices,
         )
-        pop_metrics = cm.evaluate_pop(pop_cal, pop_base, X_test, y_pop[test_idx])
+        pop_metrics = cm.evaluate_pop(pop_cal, pop_base, X_eval, y_pop[eval_idx])
 
         self.hi_models[h] = hi_reg
         self.lo_models[h] = lo_reg
@@ -159,7 +175,31 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
             "n_train": int(train_idx.sum()),
             "n_val": int(val_idx.sum()),
             "n_test": int(test_idx.sum()),
+            "n_eval": int(eval_idx.sum()),
+            "eval_on": "test" if int(test_idx.sum()) > 0 else "val",
         }
+
+    def _regime_metrics_on_val(self, h: int, cal, meta: dict) -> dict:
+        """Score the regime classifier on the validation window.
+
+        The parent ``evaluate`` only scores against a configured test window and
+        returns ``{}`` otherwise; production retrain has no test window, so we
+        mirror its calibrated-probability scoring on the val split to keep the
+        regime metrics populated instead of null. Returns ``{"ml_cal": {...}}``
+        to match what ``_summarize_regime_metrics`` reads, or ``{}`` if val is
+        empty. Like the PoP head, the calibrator is fit on val, so these regime
+        scores are mildly optimistic but symmetric across A/B variants.
+        """
+        _, mask = targets_for_horizon(self.rows, self.valid_idx, h)
+        val_idx = self.val_m & mask
+        if int(val_idx.sum()) == 0:
+            return {}
+        y = meta["y"]
+        x_val, y_val = self.X[val_idx], y[val_idx]
+        probs_cal = self._expand_classes(
+            cal.predict_proba(x_val), cal.classes_, len(y_val),
+        )
+        return {"ml_cal": self._scores(probs_cal, y_val)}
 
     # ----------------------------------------------------------------
     # Orchestration
@@ -216,6 +256,10 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
             cal, meta = self.fit_one_horizon(h)
             regime_models[h] = cal
             r = self.evaluate(h, cal, meta)
+            if not r:
+                # No test window (production retrain): score regime on val so
+                # the regime metrics are populated rather than null.
+                r = self._regime_metrics_on_val(h, cal, meta)
             if r:
                 regime_results[h] = r
 
@@ -228,6 +272,8 @@ class ExtendedForecastTrainer(RegimeForecastTrainer):
                 "n_train": cont["n_train"],
                 "n_val": cont["n_val"],
                 "n_test": cont["n_test"],
+                "n_eval": cont["n_eval"],
+                "eval_on": cont["eval_on"],
             }
             self._print_horizon_summary(h, self.metrics_per_h[h])
 
